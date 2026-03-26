@@ -1,0 +1,6 @@
+PyQt5
+groq
+keyboard
+pystray
+Pillow
+pywin32
