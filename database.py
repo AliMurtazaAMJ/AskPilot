@@ -77,6 +77,12 @@ def get_stealth():
 def set_stealth(enabled: bool):
     set_setting("stealth", "true" if enabled else "false")
 
+def get_startup():
+    return get_setting("startup", "false") == "true"
+
+def set_startup(enabled: bool):
+    set_setting("startup", "true" if enabled else "false")
+
 def create_conversation(title="New Chat"):
     with get_conn() as conn:
         conn.execute("UPDATE conversations SET is_active = 0")

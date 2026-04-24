@@ -1,18 +1,59 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit,
     QPushButton, QLabel, QScrollArea, QSizePolicy,
-    QApplication, QLineEdit, QFrame, QComboBox
+    QApplication, QLineEdit, QFrame, QComboBox, QTextBrowser
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QEvent, QTimer
 from PyQt5.QtGui import QPainter, QColor
 import ctypes
+import markdown as _md
 import database as db
 import groq_client
+import config
 from styles import get_stylesheet
+
+import re
 
 def _apply_stealth(hwnd):
     affinity = 0x11 if db.get_stealth() else 0x0
     ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, affinity)
+
+def _md_to_html(text, is_user, theme):
+    if theme == "dark":
+        text_color = "#e8e8f0" if is_user else "#d0d0d0"
+        code_bg    = "#1e1e2e"
+        code_color = "#a9b1d6"
+        pre_bg     = "#1a1a2e"
+        border     = "rgba(255,255,255,0.15)"
+    else:
+        text_color = "#1a1a2a"
+        code_bg    = "#e8e8f0"
+        code_color = "#24292e"
+        pre_bg     = "#e0e0ea"
+        border     = "rgba(0,0,0,0.15)"
+    html = _md.markdown(text, extensions=["fenced_code", "tables", "nl2br"])
+    return f"""
+    <style>
+        * {{ color:{text_color}; }}
+        body {{ font-size:13px; font-family:'Segoe UI'; margin:0; padding:0;
+                background:transparent; }}
+        p    {{ margin:4px 0; }}
+        strong{{ font-weight:700; }}
+        em   {{ font-style:italic; }}
+        code {{ background:{code_bg}; color:{code_color}; border-radius:4px;
+                padding:1px 5px; font-family:Consolas,monospace; font-size:12px; }}
+        pre  {{ background:{pre_bg}; border:1px solid {border}; border-radius:8px;
+                padding:10px 12px; font-family:Consolas,monospace; font-size:12px;
+                white-space:pre-wrap; word-wrap:break-word; }}
+        pre code {{ background:transparent; padding:0; border:none; }}
+        ul,ol{{ margin:4px 0; padding-left:20px; }}
+        li   {{ margin:2px 0; }}
+        h1,h2,h3{{ margin:6px 0 2px; }}
+        table{{ border-collapse:collapse; width:100%; }}
+        th,td{{ border:1px solid {border}; padding:4px 8px; }}
+    </style>
+    {html}
+    """
 
 SIDEBAR_W = 220
 
@@ -54,40 +95,133 @@ class TestWorker(QThread):
                 self.result.emit(f"✗ {err[:80]}", False)
 
 
+class CodeBlock(QWidget):
+    def __init__(self, code, lang, theme, max_w, toast_fn=None):
+        super().__init__()
+        self.setStyleSheet("background:transparent;")
+        is_dark = theme == "dark"
+        hdr_bg   = "#2a2a3e" if is_dark else "#d0d0e0"
+        body_bg  = "#1a1a2e" if is_dark else "#e8e8f4"
+        hdr_fg   = "#a0a0c0" if is_dark else "#444466"
+        code_fg  = "#c9d1d9" if is_dark else "#24292e"
+        border   = "rgba(255,255,255,0.1)" if is_dark else "rgba(0,0,0,0.1)"
+        copy_fg  = "rgba(255,255,255,0.35)" if is_dark else "rgba(0,0,0,0.35)"
+        copy_hov = "white" if is_dark else "#000"
+
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+
+        hdr = QWidget()
+        hdr.setFixedHeight(30)
+        hdr.setStyleSheet(f"background:{hdr_bg};border-radius:8px 8px 0 0;"
+                          f"border:1px solid {border};border-bottom:none;")
+        hdr_row = QHBoxLayout(hdr)
+        hdr_row.setContentsMargins(12, 0, 8, 0)
+        lang_lbl = QLabel(lang or "code")
+        lang_lbl.setStyleSheet(f"color:{hdr_fg};font-size:12px;font-family:'Segoe UI';"
+                               "background:transparent;border:none;")
+        copy_btn = QPushButton("⧉ Copy")
+        copy_btn.setFixedHeight(22)
+        copy_btn.setCursor(Qt.PointingHandCursor)
+        copy_btn.setStyleSheet(f"""
+            QPushButton{{background:transparent;border:none;
+                        color:{copy_fg};font-size:12px;font-family:'Segoe UI';}}
+            QPushButton:hover{{color:{copy_hov};}}
+        """)
+        def _copy():
+            QApplication.clipboard().setText(code)
+            if toast_fn: toast_fn()
+        copy_btn.clicked.connect(_copy)
+        hdr_row.addWidget(lang_lbl)
+        hdr_row.addStretch()
+        hdr_row.addWidget(copy_btn)
+
+        browser = QTextBrowser()
+        browser.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        browser.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        browser.setStyleSheet(f"QTextBrowser{{background:{body_bg};"
+                              f"border:1px solid {border};border-top:none;"
+                              "border-radius:0 0 8px 8px;padding:10px 12px;}")
+        import html as _html
+        escaped = _html.escape(code)
+        browser.setHtml(f"<pre style='margin:0;color:{code_fg};"
+                        f"font-family:Consolas,monospace;font-size:12px;"
+                        f"white-space:pre-wrap;word-wrap:break-word;'>{escaped}</pre>")
+        browser.document().setTextWidth(max_w - 4)
+        browser.setFixedWidth(max_w)
+        browser.setFixedHeight(int(browser.document().size().height()) + 20)
+
+        vbox.addWidget(hdr)
+        vbox.addWidget(browser)
+        self._browser = browser
+
+    def update_width(self, w):
+        self._browser.setFixedWidth(w)
+        self._browser.document().setTextWidth(w - 4)
+        self._browser.setFixedHeight(int(self._browser.document().size().height()) + 20)
+
+
 class MessageBubble(QWidget):
     _MAX_W = 520
 
     def __init__(self, text, is_user, theme="dark", toast_fn=None):
         super().__init__()
         self._text = text
-        self._is_user = is_user
         self.setStyleSheet("background: transparent;")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         if theme == "light":
-            css = ("QLabel{background:rgba(210,212,255,0.9);border:1px solid rgba(0,0,0,0.15);"
-                   "border-radius:12px;padding:10px 14px;color:#000000;}") if is_user else \
-                  ("QLabel{background:rgba(255,255,255,0.95);border:1px solid rgba(0,0,0,0.15);"
-                   "border-radius:12px;padding:10px 14px;color:#000000;}")
+            bubble_css = ("QTextBrowser{background:rgba(210,212,255,0.9);border:1px solid rgba(0,0,0,0.15);"
+                          "border-radius:12px;padding:6px 10px;}") if is_user else \
+                         ("QTextBrowser{background:rgba(255,255,255,0.95);border:1px solid rgba(0,0,0,0.15);"
+                          "border-radius:12px;padding:6px 10px;}")
             copy_color, copy_hover = "rgba(0,0,0,0.35)", "rgba(0,0,0,0.75)"
         else:
-            css = ("QLabel{background:rgba(99,102,241,0.2);border:1px solid rgba(99,102,241,0.3);"
-                   "border-radius:12px;padding:10px 14px;color:#e0e0ff;}") if is_user else \
-                  ("QLabel{background:rgba(40,40,60,0.7);border:1px solid rgba(255,255,255,0.08);"
-                   "border-radius:12px;padding:10px 14px;color:#d0d0d0;}")
+            bubble_css = ("QTextBrowser{background:rgba(99,102,241,0.2);border:1px solid rgba(99,102,241,0.3);"
+                          "border-radius:12px;padding:6px 10px;}") if is_user else \
+                         ("QTextBrowser{background:rgba(40,40,60,0.7);border:1px solid rgba(255,255,255,0.08);"
+                          "border-radius:12px;padding:6px 10px;}")
             copy_color, copy_hover = "rgba(128,128,128,0.6)", "rgba(99,102,241,1)"
 
-        self._label = QLabel(self._break_text(text))
-        self._label.setWordWrap(True)
-        self._label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self._label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
-        self._label.setFixedWidth(self._MAX_W)
-        self._label.setStyleSheet(css)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+
+        self._content = QWidget()
+        self._content.setStyleSheet("background:transparent;")
+        self._content.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        self._content.setFixedWidth(self._MAX_W)
+        self._col = QVBoxLayout(self._content)
+        self._col.setContentsMargins(0, 0, 0, 0)
+        self._col.setSpacing(6)
+
+        segments = re.split(r'```(\w*)\n([\s\S]*?)```', text)
+        i = 0
+        while i < len(segments):
+            prose = segments[i].strip()
+            if prose:
+                b = QTextBrowser()
+                b.setOpenExternalLinks(True)
+                b.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                b.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                b.setStyleSheet(bubble_css)
+                b.setHtml(_md_to_html(prose, is_user, theme))
+                b.document().setTextWidth(self._MAX_W - 24)
+                b.setFixedWidth(self._MAX_W)
+                b.setFixedHeight(int(b.document().size().height()) + 16)
+                self._col.addWidget(b)
+            if i + 2 < len(segments):
+                lang = segments[i + 1]
+                code = segments[i + 2]
+                cb = CodeBlock(code, lang, theme, self._MAX_W, toast_fn)
+                self._col.addWidget(cb)
+            i += 3
 
         copy_btn = QPushButton("⧉")
         copy_btn.setFixedSize(20, 20)
         copy_btn.setCursor(Qt.PointingHandCursor)
-        copy_btn.setToolTip("Copy")
+        copy_btn.setToolTip("Copy all")
         copy_btn.setStyleSheet(f"""
             QPushButton {{ background:transparent; border:none;
                           color:{copy_color}; font-size:12px; }}
@@ -95,40 +229,31 @@ class MessageBubble(QWidget):
         """)
         def _copy():
             QApplication.clipboard().setText(self._text)
-            if toast_fn:
-                toast_fn()
+            if toast_fn: toast_fn()
         copy_btn.clicked.connect(_copy)
 
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
         if is_user:
-            row.addStretch()
-            row.addWidget(self._label)
-            row.addWidget(copy_btn)
+            outer.addStretch()
+            outer.addWidget(self._content)
+            outer.addWidget(copy_btn)
         else:
-            row.addWidget(copy_btn)
-            row.addWidget(self._label)
-            row.addStretch()
+            outer.addWidget(copy_btn)
+            outer.addWidget(self._content)
+            outer.addStretch()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
         w = min(self.width() - 30, self._MAX_W)
         if w > 0:
-            self._label.setFixedWidth(w)
-
-    @staticmethod
-    def _break_text(text):
-        """Insert zero-width spaces after every 40 chars in unspaced runs."""
-        result = []
-        run = 0
-        for ch in text:
-            result.append(ch)
-            run = 0 if ch == ' ' else run + 1
-            if run == 40:
-                result.append('\u200b')  # zero-width space
-                run = 0
-        return ''.join(result)
+            self._content.setFixedWidth(w)
+            for i in range(self._col.count()):
+                widget = self._col.itemAt(i).widget()
+                if isinstance(widget, QTextBrowser):
+                    widget.setFixedWidth(w)
+                    widget.document().setTextWidth(w - 24)
+                    widget.setFixedHeight(int(widget.document().size().height()) + 16)
+                elif isinstance(widget, CodeBlock):
+                    widget.update_width(w)
 
 
 class ConvItem(QWidget):
@@ -210,7 +335,7 @@ class SettingsOverlay(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
 
         self.card = QWidget(self)
-        self.card.setFixedSize(420, 600)
+        self.card.setFixedSize(420, 660)
         self.card.setStyleSheet("""
             QWidget {
                 background: rgba(14,14,26,252);
@@ -276,6 +401,25 @@ class SettingsOverlay(QWidget):
         stealth_row.addWidget(self.stealth_on_btn)
         stealth_row.addWidget(self.stealth_off_btn)
         layout.addLayout(stealth_row)
+        layout.addWidget(self._sep())
+
+        # ── Startup ──
+        layout.addWidget(self._lbl("RUN ON STARTUP"))
+        startup_row = QHBoxLayout()
+        startup_row.setSpacing(10)
+        startup_on = config.is_startup_enabled()
+        self.startup_on_btn  = QPushButton("▶  Enabled")
+        self.startup_off_btn = QPushButton("■  Disabled")
+        for btn in (self.startup_on_btn, self.startup_off_btn):
+            btn.setFixedHeight(36)
+            btn.setCursor(Qt.PointingHandCursor)
+        self._style_toggle(self.startup_on_btn,  startup_on)
+        self._style_toggle(self.startup_off_btn, not startup_on)
+        self.startup_on_btn.clicked.connect(lambda: self._set_startup(True))
+        self.startup_off_btn.clicked.connect(lambda: self._set_startup(False))
+        startup_row.addWidget(self.startup_on_btn)
+        startup_row.addWidget(self.startup_off_btn)
+        layout.addLayout(startup_row)
         layout.addWidget(self._sep())
 
         # ── Model selector ──
@@ -467,6 +611,16 @@ class SettingsOverlay(QWidget):
             if w.isVisible() and w.winId():
                 ctypes.windll.user32.SetWindowDisplayAffinity(
                     int(w.winId()), 0x11 if enabled else 0x0)
+
+    def _set_startup(self, enabled):
+        try:
+            config.enable_startup() if enabled else config.disable_startup()
+            self._style_toggle(self.startup_on_btn,  enabled)
+            self._style_toggle(self.startup_off_btn, not enabled)
+        except Exception as e:
+            self.status.setStyleSheet("color:rgba(255,100,100,0.9);font-size:12px;"
+                                      "background:transparent;border:none;")
+            self.status.setText(f"✗ Startup error: {str(e)[:60]}")
 
     def paintEvent(self, _):
         p = QPainter(self)

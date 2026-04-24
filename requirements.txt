@@ -4,3 +4,4 @@ keyboard
 pystray
 Pillow
 pywin32
+markdown
