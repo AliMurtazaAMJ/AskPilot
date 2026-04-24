@@ -2,7 +2,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit,
     QPushButton, QLabel, QScrollArea, QSizePolicy, QApplication
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent, QPropertyAnimation
 from PyQt5.QtGui import QPainter, QColor, QPainterPath, QCursor
 import database as db
 import groq_client
@@ -38,21 +38,15 @@ class GroqWorker(QThread):
         self.response_ready.emit(groq_client.get_response(self.messages))
 
 
-# ── bubble with copy button (same row) ───────────────────────────────────────
 class MessageBubble(QWidget):
-    def __init__(self, text, is_user, theme="dark"):
+    _MAX_W = BODY_W - 30
+
+    def __init__(self, text, is_user, theme="dark", toast_fn=None):
         super().__init__()
         self._text = text
+        self._is_user = is_user
         self.setStyleSheet("background: transparent;")
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(4)
-
-        label = QLabel(text)
-        label.setWordWrap(True)
-        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-        label.setMaximumWidth(BODY_W - 40)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         if theme == "light":
             user_css = ("background:rgba(210,212,255,0.9);border:1px solid rgba(0,0,0,0.15);"
@@ -69,7 +63,12 @@ class MessageBubble(QWidget):
             copy_color = "rgba(255,255,255,0.28)"
             copy_hover = "rgba(255,255,255,0.85)"
 
-        label.setStyleSheet(user_css if is_user else bot_css)
+        self._label = QLabel(self._break_text(text))
+        self._label.setWordWrap(True)
+        self._label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        self._label.setFixedWidth(self._MAX_W)
+        self._label.setStyleSheet(user_css if is_user else bot_css)
 
         copy_btn = QPushButton("⧉")
         copy_btn.setFixedSize(20, 20)
@@ -80,17 +79,43 @@ class MessageBubble(QWidget):
                           color:{copy_color}; font-size:12px; }}
             QPushButton:hover {{ color:{copy_hover}; }}
         """)
-        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(self._text))
+        def _copy():
+            QApplication.clipboard().setText(self._text)
+            if toast_fn:
+                toast_fn()
+        copy_btn.clicked.connect(_copy)
         copy_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
         if is_user:
             row.addStretch()
-            row.addWidget(label)
+            row.addWidget(self._label)
             row.addWidget(copy_btn)
         else:
             row.addWidget(copy_btn)
-            row.addWidget(label)
+            row.addWidget(self._label)
             row.addStretch()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        w = min(self.width() - 30, self._MAX_W)
+        if w > 0:
+            self._label.setFixedWidth(w)
+
+    @staticmethod
+    def _break_text(text):
+        """Insert zero-width spaces after every 40 chars in unspaced runs."""
+        result = []
+        run = 0
+        for ch in text:
+            result.append(ch)
+            run = 0 if ch == ' ' else run + 1
+            if run == 40:
+                result.append('\u200b')
+                run = 0
+        return ''.join(result)
 
 
 # ── popup ─────────────────────────────────────────────────────────────────────
@@ -173,7 +198,8 @@ class PopupWindow(QWidget):
 
         if self._body_h > 0:
             body = QPainterPath()
-            body.addRoundedRect(15, cap_h - 12, BODY_W, self._body_h + 12, 18, 18)
+            body.addRoundedRect(15, cap_h + 3
+            , BODY_W, self._body_h, 18, 18)
             p.setPen(self._card_edge)
             p.setBrush(self._card_bg)
             p.drawPath(body)
@@ -181,6 +207,75 @@ class PopupWindow(QWidget):
 
     # ── build ui ──────────────────────────────────────────────────────────────
     def _build_ui(self):
+        # card created FIRST → lower z-order, capsule widgets on top naturally
+        self.card = QWidget(self)
+        self.card.setStyleSheet("background: transparent;")
+        self.card.hide()
+
+        card_layout = QVBoxLayout(self.card)
+        card_layout.setContentsMargins(10, 14, 10, 6)
+        card_layout.setSpacing(4)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical { background: transparent; width: 3px; }
+            QScrollBar::handle:vertical { background: rgba(255,255,255,0.15); border-radius:1px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        """)
+        self.chat_widget = QWidget()
+        self.chat_widget.setStyleSheet("background: transparent;")
+        self.chat_layout = QVBoxLayout(self.chat_widget)
+        self.chat_layout.setSpacing(6)
+        self.chat_layout.setContentsMargins(2, 2, 2, 2)
+        self.chat_layout.addStretch()
+        self.scroll.setWidget(self.chat_widget)
+        card_layout.addWidget(self.scroll, 1)
+
+        exp_row = QHBoxLayout()
+        exp_row.setContentsMargins(0, 0, 0, 0)
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedSize(EXPAND_BTN, EXPAND_BTN)
+        self.close_btn.setCursor(Qt.PointingHandCursor)
+        self.close_btn.setStyleSheet("""
+            QPushButton { background:transparent; border:none;
+                          color:rgba(255,255,255,0.25); font-size:13px; }
+            QPushButton:hover { color:rgba(255,80,80,1); }
+        """)
+        self.close_btn.clicked.connect(self.hide)
+        self.expand_btn = QPushButton("↗")
+        self.expand_btn.setFixedSize(EXPAND_BTN, EXPAND_BTN)
+        self.expand_btn.setCursor(Qt.PointingHandCursor)
+        self.expand_btn.setStyleSheet("""
+            QPushButton { background:transparent; border:none;
+                          color:rgba(255,255,255,0.25); font-size:14px; }
+            QPushButton:hover { color:rgba(99,102,241,1); }
+        """)
+        self.expand_btn.clicked.connect(self._on_expand)
+        exp_row.addWidget(self.close_btn)
+        exp_row.addStretch()
+        exp_row.addWidget(self.expand_btn)
+        card_layout.addLayout(exp_row)
+
+        # toast — sits at bottom-center of the card
+        self._toast = QLabel("Message copied", self.card)
+        self._toast.setAttribute(Qt.WA_StyledBackground, True)
+        self._toast.setAlignment(Qt.AlignCenter)
+        self._toast.setStyleSheet("""
+            QLabel { background:rgba(99,102,241,0.92); color:#ffffff;
+                     border:none; border-radius:16px;
+                     padding:6px 18px; font-size:11px;
+                     font-family:'Segoe UI'; font-weight:600; }
+        """)
+        self._toast.adjustSize()
+        self._toast.hide()
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self._toast.hide)
+
+        # capsule widgets created AFTER card → higher z-order, always on top
         self.plus_btn = QPushButton("+", self)
         self.plus_btn.setFixedSize(BTN_D, BTN_D)
         self.plus_btn.move(BTN_X, BTN_Y)
@@ -210,60 +305,19 @@ class PopupWindow(QWidget):
         self.input_bar.installEventFilter(self)
         self._reposition_input()
 
-        self.card = QWidget(self)
-        self.card.setStyleSheet("background: transparent;")
-        self.card.hide()
-
-        card_layout = QVBoxLayout(self.card)
-        card_layout.setContentsMargins(10, 14, 10, 6)
-        card_layout.setSpacing(4)
-
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.scroll.setStyleSheet("""
-            QScrollArea { background: transparent; border: none; }
-            QScrollBar:vertical { background: transparent; width: 3px; }
-            QScrollBar::handle:vertical { background: rgba(255,255,255,0.15); border-radius:1px; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        """)
-        self.chat_widget = QWidget()
-        self.chat_widget.setStyleSheet("background: transparent;")
-        self.chat_layout = QVBoxLayout(self.chat_widget)
-        self.chat_layout.setSpacing(6)
-        self.chat_layout.setContentsMargins(2, 2, 2, 2)
-        self.chat_layout.addStretch()
-        self.scroll.setWidget(self.chat_widget)
-        card_layout.addWidget(self.scroll, 1)
-
-        # bottom row: close ✕ left, expand ↗ right
-        exp_row = QHBoxLayout()
-        exp_row.setContentsMargins(0, 0, 0, 0)
-        self.close_btn = QPushButton("✕")
-        self.close_btn.setFixedSize(EXPAND_BTN, EXPAND_BTN)
-        self.close_btn.setCursor(Qt.PointingHandCursor)
-        self.close_btn.setStyleSheet("""
-            QPushButton { background:transparent; border:none;
-                          color:rgba(255,255,255,0.25); font-size:13px; }
-            QPushButton:hover { color:rgba(255,80,80,1); }
-        """)
-        self.close_btn.clicked.connect(self.hide)
-        self.expand_btn = QPushButton("↗")
-        self.expand_btn.setFixedSize(EXPAND_BTN, EXPAND_BTN)
-        self.expand_btn.setCursor(Qt.PointingHandCursor)
-        self.expand_btn.setStyleSheet("""
-            QPushButton { background:transparent; border:none;
-                          color:rgba(255,255,255,0.25); font-size:14px; }
-            QPushButton:hover { color:rgba(99,102,241,1); }
-        """)
-        self.expand_btn.clicked.connect(self._on_expand)
-        exp_row.addWidget(self.close_btn)
-        exp_row.addStretch()
-        exp_row.addWidget(self.expand_btn)
-        card_layout.addLayout(exp_row)
+    def show_toast(self):
+        self._toast_timer.stop()
+        self._toast.adjustSize()
+        self._toast.move(
+            (self.card.width() - self._toast.width()) // 2,
+            self.card.height() - self._toast.height() - 8)
+        self._toast.show()
+        self._toast.raise_()
+        self._toast_timer.start(1800)
 
     def _reposition_input(self):
         self.input_bar.setGeometry(INPUT_X, BTN_Y, INPUT_W, self._input_h)
+        self.input_bar.document().setTextWidth(INPUT_W - 16)
 
     def _on_input_changed(self):
         doc_h = int(self.input_bar.document().size().height()) + 10
@@ -276,11 +330,11 @@ class PopupWindow(QWidget):
     def _resize(self):
         cap_h = self._cap_h()
         if self._body_h > 0:
-            self.card.setGeometry(15, cap_h, BODY_W, self._body_h)
+            self.card.setGeometry(15, cap_h + 4, BODY_W, self._body_h)
             self.card.show()
         else:
             self.card.hide()
-        self.setFixedSize(W, cap_h + self._body_h)
+        self.setFixedSize(W, cap_h + self._body_h + 4)
         self.update()
 
     def _update_body_height(self):
@@ -307,7 +361,7 @@ class PopupWindow(QWidget):
                 item.widget().deleteLater()
 
     def _add_bubble(self, text, is_user):
-        bubble = MessageBubble(text, is_user, self._theme)
+        bubble = MessageBubble(text, is_user, self._theme, toast_fn=self.show_toast)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble)
         QTimer.singleShot(50, self._update_body_height)
         QTimer.singleShot(80, lambda: self.scroll.verticalScrollBar().setValue(

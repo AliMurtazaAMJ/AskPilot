@@ -3,7 +3,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QScrollArea, QSizePolicy,
     QApplication, QLineEdit, QFrame
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QEvent
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QEvent, QTimer
 from PyQt5.QtGui import QPainter, QColor
 import database as db
 import groq_client
@@ -22,45 +22,34 @@ class GroqWorker(QThread):
 
 
 class MessageBubble(QWidget):
-    def __init__(self, text, is_user, theme="dark"):
+    _MAX_W = 520
+
+    def __init__(self, text, is_user, theme="dark", toast_fn=None):
         super().__init__()
         self._text = text
+        self._is_user = is_user
         self.setStyleSheet("background: transparent;")
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        label = QLabel(text)
-        label.setObjectName("UserBubble" if is_user else "BotBubble")
-        label.setWordWrap(True)
-        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-        label.setMaximumWidth(520)
-
-        # override bubble colors for light mode since QSS #objectName
-        # may not propagate through transparent parents reliably
         if theme == "light":
-            if is_user:
-                label.setStyleSheet(
-                    "background:rgba(210,212,255,0.9);border:1px solid rgba(0,0,0,0.15);"
-                    "border-radius:12px;padding:10px 14px;color:#000000;")
-            else:
-                label.setStyleSheet(
-                    "background:rgba(255,255,255,0.95);border:1px solid rgba(0,0,0,0.15);"
-                    "border-radius:12px;padding:10px 14px;color:#000000;")
-            copy_color = "rgba(0,0,0,0.35)"
-            copy_hover = "rgba(0,0,0,0.75)"
+            css = ("QLabel{background:rgba(210,212,255,0.9);border:1px solid rgba(0,0,0,0.15);"
+                   "border-radius:12px;padding:10px 14px;color:#000000;}") if is_user else \
+                  ("QLabel{background:rgba(255,255,255,0.95);border:1px solid rgba(0,0,0,0.15);"
+                   "border-radius:12px;padding:10px 14px;color:#000000;}")
+            copy_color, copy_hover = "rgba(0,0,0,0.35)", "rgba(0,0,0,0.75)"
         else:
-            if is_user:
-                label.setStyleSheet(
-                    "background:rgba(99,102,241,0.2);border:1px solid rgba(99,102,241,0.3);"
-                    "border-radius:12px;padding:10px 14px;color:#e0e0ff;")
-            else:
-                label.setStyleSheet(
-                    "background:rgba(40,40,60,0.7);border:1px solid rgba(255,255,255,0.08);"
-                    "border-radius:12px;padding:10px 14px;color:#d0d0d0;")
-            copy_color = "rgba(128,128,128,0.6)"
-            copy_hover = "rgba(99,102,241,1)"
+            css = ("QLabel{background:rgba(99,102,241,0.2);border:1px solid rgba(99,102,241,0.3);"
+                   "border-radius:12px;padding:10px 14px;color:#e0e0ff;}") if is_user else \
+                  ("QLabel{background:rgba(40,40,60,0.7);border:1px solid rgba(255,255,255,0.08);"
+                   "border-radius:12px;padding:10px 14px;color:#d0d0d0;}")
+            copy_color, copy_hover = "rgba(128,128,128,0.6)", "rgba(99,102,241,1)"
+
+        self._label = QLabel(self._break_text(text))
+        self._label.setWordWrap(True)
+        self._label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        self._label.setFixedWidth(self._MAX_W)
+        self._label.setStyleSheet(css)
 
         copy_btn = QPushButton("⧉")
         copy_btn.setFixedSize(20, 20)
@@ -71,16 +60,42 @@ class MessageBubble(QWidget):
                           color:{copy_color}; font-size:12px; }}
             QPushButton:hover {{ color:{copy_hover}; }}
         """)
-        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(self._text))
+        def _copy():
+            QApplication.clipboard().setText(self._text)
+            if toast_fn:
+                toast_fn()
+        copy_btn.clicked.connect(_copy)
 
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
         if is_user:
             row.addStretch()
-            row.addWidget(label)
+            row.addWidget(self._label)
             row.addWidget(copy_btn)
         else:
             row.addWidget(copy_btn)
-            row.addWidget(label)
+            row.addWidget(self._label)
             row.addStretch()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        w = min(self.width() - 30, self._MAX_W)
+        if w > 0:
+            self._label.setFixedWidth(w)
+
+    @staticmethod
+    def _break_text(text):
+        """Insert zero-width spaces after every 40 chars in unspaced runs."""
+        result = []
+        run = 0
+        for ch in text:
+            result.append(ch)
+            run = 0 if ch == ' ' else run + 1
+            if run == 40:
+                result.append('\u200b')  # zero-width space
+                run = 0
+        return ''.join(result)
 
 
 class ConvItem(QWidget):
@@ -432,6 +447,7 @@ class MainWindow(QWidget):
         self.input_bar = QTextEdit()
         self.input_bar.setFixedHeight(56)
         self.input_bar.setPlaceholderText("Ask anything...  (Enter to send, Shift+Enter for newline)")
+        self.input_bar.setLineWrapMode(QTextEdit.WidgetWidth)
         self.input_bar.installEventFilter(self)
 
         self.send_btn = QPushButton("➤")
@@ -458,6 +474,22 @@ class MainWindow(QWidget):
         self.settings_overlay.theme_changed.connect(self._on_theme_changed)
         self.settings_overlay.hide()
 
+        # toast label — sits at bottom-center of container
+        self._toast = QLabel("Message copied", self.container)
+        self._toast.setAttribute(Qt.WA_StyledBackground, True)
+        self._toast.setAlignment(Qt.AlignCenter)
+        self._toast.setStyleSheet("""
+            QLabel { background:rgba(99,102,241,0.92); color:#ffffff;
+                     border:none; border-radius:20px;
+                     padding:8px 22px; font-size:12px;
+                     font-family:'Segoe UI'; font-weight:600; }
+        """)
+        self._toast.adjustSize()
+        self._toast.hide()
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self._toast.hide)
+
     def _on_theme_changed(self, theme):
         self.apply_theme(theme)
         self.theme_changed.emit(theme)
@@ -466,6 +498,20 @@ class MainWindow(QWidget):
         super().resizeEvent(e)
         self.settings_overlay.setGeometry(
             0, 0, self.container.width(), self.container.height())
+        self._toast.adjustSize()
+        self._toast.move(
+            (self.container.width() - self._toast.width()) // 2,
+            self.container.height() - self._toast.height() - 20)
+
+    def show_toast(self):
+        self._toast_timer.stop()
+        self._toast.adjustSize()
+        self._toast.move(
+            (self.container.width() - self._toast.width()) // 2,
+            self.container.height() - self._toast.height() - 20)
+        self._toast.show()
+        self._toast.raise_()
+        self._toast_timer.start(1800)
 
     def _toggle_settings(self):
         if self.settings_overlay.isVisible():
@@ -515,7 +561,7 @@ class MainWindow(QWidget):
                 item.widget().deleteLater()
 
     def _add_bubble(self, text, is_user):
-        bubble = MessageBubble(text, is_user, self._theme)
+        bubble = MessageBubble(text, is_user, self._theme, toast_fn=self.show_toast)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble)
         self.chat_scroll.verticalScrollBar().setValue(
             self.chat_scroll.verticalScrollBar().maximum())
