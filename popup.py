@@ -4,9 +4,14 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent, QPropertyAnimation
 from PyQt5.QtGui import QPainter, QColor, QPainterPath, QCursor
+import ctypes
 import database as db
 import groq_client
 from styles import get_stylesheet
+
+def _apply_stealth(hwnd):
+    affinity = 0x11 if db.get_stealth() else 0x0
+    ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, affinity)
 
 # ── constants ────────────────────────────────────────────────────────────────
 W            = 340
@@ -449,6 +454,7 @@ class PopupWindow(QWidget):
         if prefill:
             self.input_bar.setPlainText(prefill)
         self.show()
+        _apply_stealth(int(self.winId()))
         self.raise_()
         self.activateWindow()
         self.input_bar.setFocus()

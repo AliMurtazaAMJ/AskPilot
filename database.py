@@ -37,18 +37,45 @@ def set_setting(key, value):
     with get_conn() as conn:
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
 
-def get_api_key():
-    """Return user API key from DB, or None if not set."""
-    return get_setting("groq_api_key")
+import json as _json
 
-def set_api_key(key):
-    set_setting("groq_api_key", key)
+def get_api_keys() -> list:
+    """Return ordered list of user API keys."""
+    raw = get_setting("groq_api_keys")
+    return _json.loads(raw) if raw else []
+
+def set_api_keys(keys: list):
+    set_setting("groq_api_keys", _json.dumps(keys))
+
+def add_api_key(key: str):
+    keys = get_api_keys()
+    if key and key not in keys:
+        keys.append(key)
+        set_api_keys(keys)
+
+def remove_api_key(key: str):
+    keys = get_api_keys()
+    if key in keys:
+        keys.remove(key)
+        set_api_keys(keys)
+
+def get_selected_model() -> str:
+    return get_setting("selected_model", "")
+
+def set_selected_model(model: str):
+    set_setting("selected_model", model)
 
 def get_theme():
     return get_setting("theme", "dark")
 
 def set_theme(theme):
     set_setting("theme", theme)
+
+def get_stealth():
+    return get_setting("stealth", "true") == "true"
+
+def set_stealth(enabled: bool):
+    set_setting("stealth", "true" if enabled else "false")
 
 def create_conversation(title="New Chat"):
     with get_conn() as conn:

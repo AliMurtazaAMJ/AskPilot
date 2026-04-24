@@ -1,13 +1,18 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit,
     QPushButton, QLabel, QScrollArea, QSizePolicy,
-    QApplication, QLineEdit, QFrame
+    QApplication, QLineEdit, QFrame, QComboBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QEvent, QTimer
 from PyQt5.QtGui import QPainter, QColor
+import ctypes
 import database as db
 import groq_client
 from styles import get_stylesheet
+
+def _apply_stealth(hwnd):
+    affinity = 0x11 if db.get_stealth() else 0x0
+    ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, affinity)
 
 SIDEBAR_W = 220
 
@@ -19,6 +24,34 @@ class GroqWorker(QThread):
         self.messages = messages
     def run(self):
         self.response_ready.emit(groq_client.get_response(self.messages))
+
+
+class TestWorker(QThread):
+    result = pyqtSignal(str, bool)  # (message, success)
+    def __init__(self, key, model):
+        super().__init__()
+        self.key = key
+        self.model = model
+    def run(self):
+        try:
+            from groq import Groq
+            resp = Groq(api_key=self.key).chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content":
+                    "Reply with only the answer, nothing else. What is 47 + 36?"}],
+                max_tokens=20,
+            )
+            answer = resp.choices[0].message.content
+            if not answer or not answer.strip():
+                self.result.emit(f"⚠ {self.model} — no response (model may be restricted)", False)
+            else:
+                self.result.emit(f"✓ {self.model} → {answer.strip()}", True)
+        except Exception as e:
+            err = str(e)
+            if "model" in err.lower() or "not found" in err.lower() or "decommissioned" in err.lower():
+                self.result.emit(f"⚠ Model not accessible: {err[:60]}", False)
+            else:
+                self.result.emit(f"✗ {err[:80]}", False)
 
 
 class MessageBubble(QWidget):
@@ -177,7 +210,7 @@ class SettingsOverlay(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
 
         self.card = QWidget(self)
-        self.card.setFixedSize(400, 480)
+        self.card.setFixedSize(420, 600)
         self.card.setStyleSheet("""
             QWidget {
                 background: rgba(14,14,26,252);
@@ -188,7 +221,7 @@ class SettingsOverlay(QWidget):
 
         layout = QVBoxLayout(self.card)
         layout.setContentsMargins(28, 22, 28, 22)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
 
         hdr = QHBoxLayout()
         title = QLabel("Settings")
@@ -207,6 +240,7 @@ class SettingsOverlay(QWidget):
         layout.addLayout(hdr)
         layout.addWidget(self._sep())
 
+        # ── Theme ──
         layout.addWidget(self._lbl("THEME"))
         theme_row = QHBoxLayout()
         theme_row.setSpacing(10)
@@ -214,10 +248,10 @@ class SettingsOverlay(QWidget):
         self.dark_btn  = QPushButton("🌙  Dark")
         self.light_btn = QPushButton("☀️  Light")
         for btn in (self.dark_btn, self.light_btn):
-            btn.setFixedHeight(38)
+            btn.setFixedHeight(36)
             btn.setCursor(Qt.PointingHandCursor)
-        self._style_theme_btn(self.dark_btn,  current == "dark")
-        self._style_theme_btn(self.light_btn, current == "light")
+        self._style_toggle(self.dark_btn,  current == "dark")
+        self._style_toggle(self.light_btn, current == "light")
         self.dark_btn.clicked.connect(lambda: self._set_theme("dark"))
         self.light_btn.clicked.connect(lambda: self._set_theme("light"))
         theme_row.addWidget(self.dark_btn)
@@ -225,50 +259,173 @@ class SettingsOverlay(QWidget):
         layout.addLayout(theme_row)
         layout.addWidget(self._sep())
 
-        layout.addWidget(self._lbl("GROQ API KEY"))
-        self.api_input = QLineEdit()
-        self.api_input.setPlaceholderText("Enter your Groq API key...")
-        self.api_input.setEchoMode(QLineEdit.Password)
-        self.api_input.setFixedHeight(40)
-        self.api_input.setStyleSheet("""
+        # ── Stealth ──
+        layout.addWidget(self._lbl("STEALTH MODE"))
+        stealth_row = QHBoxLayout()
+        stealth_row.setSpacing(10)
+        stealth_on = db.get_stealth()
+        self.stealth_on_btn  = QPushButton("🔒  Hidden")
+        self.stealth_off_btn = QPushButton("👁  Visible")
+        for btn in (self.stealth_on_btn, self.stealth_off_btn):
+            btn.setFixedHeight(36)
+            btn.setCursor(Qt.PointingHandCursor)
+        self._style_toggle(self.stealth_on_btn,  stealth_on)
+        self._style_toggle(self.stealth_off_btn, not stealth_on)
+        self.stealth_on_btn.clicked.connect(lambda: self._set_stealth(True))
+        self.stealth_off_btn.clicked.connect(lambda: self._set_stealth(False))
+        stealth_row.addWidget(self.stealth_on_btn)
+        stealth_row.addWidget(self.stealth_off_btn)
+        layout.addLayout(stealth_row)
+        layout.addWidget(self._sep())
+
+        # ── Model selector ──
+        layout.addWidget(self._lbl("MODEL"))
+        self.model_combo = QComboBox()
+        self.model_combo.setFixedHeight(36)
+        self.model_combo.setStyleSheet("""
+            QComboBox{background:rgba(255,255,255,0.06);
+                      border:1px solid rgba(255,255,255,0.12);
+                      border-radius:10px;color:white;
+                      padding:4px 12px;font-size:13px;}
+            QComboBox:focus{border:1px solid rgba(99,102,241,0.6);}
+            QComboBox QAbstractItemView{background:rgba(20,20,36,255);color:white;
+                                        selection-background-color:rgba(99,102,241,0.5);}
+        """)
+        for m in groq_client.AVAILABLE_MODELS:
+            self.model_combo.addItem(m)
+        saved_model = db.get_selected_model() or groq_client.AVAILABLE_MODELS[0]
+        idx = self.model_combo.findText(saved_model)
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+        self.model_combo.currentTextChanged.connect(db.set_selected_model)
+        layout.addWidget(self.model_combo)
+        layout.addWidget(self._sep())
+
+        # ── API Keys ──
+        layout.addWidget(self._lbl("GROQ API KEYS  (tried in order, fallback if all fail)"))
+        keys_scroll = QScrollArea()
+        keys_scroll.setWidgetResizable(True)
+        keys_scroll.setFixedHeight(100)
+        keys_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        keys_scroll.setStyleSheet("""
+            QScrollArea{background:transparent;border:none;}
+            QScrollBar:vertical{background:transparent;width:4px;}
+            QScrollBar::handle:vertical{background:rgba(255,255,255,0.15);border-radius:2px;}
+            QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}
+        """)
+        keys_container = QWidget()
+        keys_container.setStyleSheet("background:transparent;")
+        self.keys_layout = QVBoxLayout(keys_container)
+        self.keys_layout.setSpacing(4)
+        self.keys_layout.setContentsMargins(0, 0, 4, 0)
+        self.keys_layout.addStretch()
+        keys_scroll.setWidget(keys_container)
+        layout.addWidget(keys_scroll)
+        self._refresh_keys()
+
+        add_row = QHBoxLayout()
+        add_row.setSpacing(6)
+        self.key_input = QLineEdit()
+        self.key_input.setPlaceholderText("Add a Groq API key...")
+        self.key_input.setEchoMode(QLineEdit.Password)
+        self.key_input.setFixedHeight(36)
+        self.key_input.setStyleSheet("""
             QLineEdit{background:rgba(255,255,255,0.06);
                       border:1px solid rgba(255,255,255,0.12);
                       border-radius:10px;color:white;
-                      padding:8px 12px;font-size:13px;}
+                      padding:6px 12px;font-size:13px;}
             QLineEdit:focus{border:1px solid rgba(99,102,241,0.6);}
         """)
-        saved = db.get_api_key()
-        if saved:
-            self.api_input.setText(saved)
-        layout.addWidget(self.api_input)
-
-        save_btn = QPushButton("Save API Key")
-        save_btn.setFixedHeight(38)
-        save_btn.setCursor(Qt.PointingHandCursor)
-        save_btn.setStyleSheet("""
-            QPushButton{background:rgba(99,102,241,0.35);
+        add_btn = QPushButton("+")
+        add_btn.setFixedSize(36, 36)
+        add_btn.setCursor(Qt.PointingHandCursor)
+        add_btn.setStyleSheet("""
+            QPushButton{background:rgba(99,102,241,0.4);
                         border:1px solid rgba(99,102,241,0.5);
-                        border-radius:10px;color:#a5b4fc;
-                        font-size:13px;font-weight:600;}
-            QPushButton:hover{background:rgba(99,102,241,0.55);color:white;}
+                        border-radius:10px;color:white;font-size:18px;font-weight:bold;}
+            QPushButton:hover{background:rgba(99,102,241,0.65);}
         """)
-        save_btn.clicked.connect(self._save_api)
-        layout.addWidget(save_btn)
+        add_btn.clicked.connect(self._add_key)
+        add_row.addWidget(self.key_input, 1)
+        add_row.addWidget(add_btn)
+        layout.addLayout(add_row)
 
         self.status = QLabel("")
         self.status.setStyleSheet("color:rgba(99,241,150,0.85);font-size:12px;"
                                   "background:transparent;border:none;")
         layout.addWidget(self.status)
-        layout.addWidget(self._sep())
-
-        layout.addWidget(self._lbl("ABOUT"))
-        about = QLabel("AskPilot — Your AI, one shortcut away.\n"
-                       "Press Ctrl+Shift+W anywhere to ask instantly.")
-        about.setWordWrap(True)
-        about.setStyleSheet("color:rgba(255,255,255,0.4);font-size:12px;"
-                            "background:transparent;border:none;")
-        layout.addWidget(about)
         layout.addStretch()
+
+    def _refresh_keys(self):
+        while self.keys_layout.count() > 1:
+            item = self.keys_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for key in db.get_api_keys():
+            row = QHBoxLayout()
+            lbl = QLabel(key[:8] + "..." + key[-4:])
+            lbl.setStyleSheet("color:rgba(255,255,255,0.6);font-size:12px;"
+                              "background:transparent;border:none;")
+            test_btn = QPushButton("Test")
+            test_btn.setFixedHeight(22)
+            test_btn.setCursor(Qt.PointingHandCursor)
+            test_btn.setStyleSheet("""
+                QPushButton{background:rgba(99,102,241,0.3);
+                            border:1px solid rgba(99,102,241,0.5);
+                            border-radius:6px;color:#a5b4fc;font-size:11px;padding:0 6px;}
+                QPushButton:hover{background:rgba(99,102,241,0.55);color:white;}
+                QPushButton:disabled{color:rgba(128,128,128,0.4);}
+            """)
+            test_btn.clicked.connect(lambda _, k=key, b=test_btn: self._test_key(k, b))
+            del_btn = QPushButton("✕")
+            del_btn.setFixedSize(22, 22)
+            del_btn.setCursor(Qt.PointingHandCursor)
+            del_btn.setStyleSheet("""
+                QPushButton{background:transparent;border:none;
+                            color:rgba(255,80,80,0.6);font-size:11px;}
+                QPushButton:hover{color:rgba(255,80,80,1);}
+            """)
+            del_btn.clicked.connect(lambda _, k=key: self._remove_key(k))
+            row.addWidget(lbl, 1)
+            row.addWidget(test_btn)
+            row.addWidget(del_btn)
+            w = QWidget()
+            w.setStyleSheet("background:transparent;border:none;")
+            w.setLayout(row)
+            self.keys_layout.insertWidget(self.keys_layout.count() - 1, w)
+
+    def _test_key(self, key, btn):
+        model = self.model_combo.currentText()
+        btn.setEnabled(False)
+        btn.setText("...")
+        self.status.setStyleSheet("color:rgba(255,255,255,0.5);font-size:12px;"
+                                  "background:transparent;border:none;")
+        self.status.setText(f"Testing {key[:8]}... with {model}")
+        self._test_worker = TestWorker(key, model)
+        self._test_worker.result.connect(lambda msg, ok, b=btn: self._on_test_result(msg, ok, b))
+        self._test_worker.start()
+
+    def _on_test_result(self, msg, ok, btn):
+        btn.setEnabled(True)
+        btn.setText("Test")
+        color = "rgba(99,241,150,0.85)" if ok else "rgba(255,100,100,0.9)"
+        self.status.setStyleSheet(f"color:{color};font-size:12px;"
+                                   "background:transparent;border:none;")
+        self.status.setText(msg)
+
+    def _add_key(self):
+        key = self.key_input.text().strip()
+        if not key:
+            return
+        db.add_api_key(key)
+        self.key_input.clear()
+        self._refresh_keys()
+        self.status.setText("✓ Key added")
+
+    def _remove_key(self, key):
+        db.remove_api_key(key)
+        self._refresh_keys()
+        self.status.setText("Key removed")
 
     def _sep(self):
         f = QFrame(); f.setFrameShape(QFrame.HLine)
@@ -281,7 +438,7 @@ class SettingsOverlay(QWidget):
                         "letter-spacing:1.2px;background:transparent;border:none;")
         return l
 
-    def _style_theme_btn(self, btn, active):
+    def _style_toggle(self, btn, active):
         if active:
             btn.setStyleSheet("""
                 QPushButton{background:rgba(99,102,241,0.5);
@@ -298,14 +455,18 @@ class SettingsOverlay(QWidget):
 
     def _set_theme(self, theme):
         db.set_theme(theme)
-        self._style_theme_btn(self.dark_btn,  theme == "dark")
-        self._style_theme_btn(self.light_btn, theme == "light")
+        self._style_toggle(self.dark_btn,  theme == "dark")
+        self._style_toggle(self.light_btn, theme == "light")
         self.theme_changed.emit(theme)
 
-    def _save_api(self):
-        key = self.api_input.text().strip()
-        db.set_api_key(key)
-        self.status.setText("✓ Saved" if key else "Cleared")
+    def _set_stealth(self, enabled):
+        db.set_stealth(enabled)
+        self._style_toggle(self.stealth_on_btn,  enabled)
+        self._style_toggle(self.stealth_off_btn, not enabled)
+        for w in QApplication.topLevelWidgets():
+            if w.isVisible() and w.winId():
+                ctypes.windll.user32.SetWindowDisplayAffinity(
+                    int(w.winId()), 0x11 if enabled else 0x0)
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -333,7 +494,7 @@ class MainWindow(QWidget):
         self.drag_pos = None
         self._theme   = db.get_theme()
         self._conv_icon_fg = "rgba(0,0,0,0.4)" if self._theme == "light" else "rgba(255,255,255,0.25)"
-        self.setWindowFlags(Qt.FramelessWindowHint)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(900, 620)
         self._build_ui()
@@ -598,10 +759,6 @@ class MainWindow(QWidget):
                 return True
         return super().eventFilter(obj, event)
 
-    def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton:
-            self.drag_pos = e.globalPos() - self.frameGeometry().topLeft()
-
-    def mouseMoveEvent(self, e):
-        if e.buttons() == Qt.LeftButton and self.drag_pos:
-            self.move(e.globalPos() - self.drag_pos)
+    def showEvent(self, e):
+        super().showEvent(e)
+        _apply_stealth(int(self.winId()))
