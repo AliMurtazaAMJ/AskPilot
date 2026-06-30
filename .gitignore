@@ -1,2 +1,4 @@
 /__pycache__
 chatbot.db
+/Stealth GPT/stealth_gpt_data
+*.pyc

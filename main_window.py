@@ -1,7 +1,7 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit,
     QPushButton, QLabel, QScrollArea, QSizePolicy,
-    QApplication, QLineEdit, QFrame, QComboBox, QTextBrowser
+    QApplication, QLineEdit, QFrame, QComboBox, QTextBrowser, QCheckBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QEvent, QTimer
 from PyQt5.QtGui import QPainter, QColor
@@ -422,6 +422,23 @@ class SettingsOverlay(QWidget):
         layout.addLayout(startup_row)
         layout.addWidget(self._sep())
 
+        # ── Desktop shortcut ──
+        layout.addWidget(self._lbl("DESKTOP SHORTCUT"))
+        self.shortcut_chk = QCheckBox("  Add shortcut to Desktop")
+        self.shortcut_chk.setChecked(config.is_shortcut_exists())
+        self.shortcut_chk.setStyleSheet("""
+            QCheckBox{color:rgba(255,255,255,0.75);font-size:13px;
+                      background:transparent;border:none;spacing:8px;}
+            QCheckBox::indicator{width:18px;height:18px;border-radius:5px;
+                                 border:1px solid rgba(255,255,255,0.2);
+                                 background:rgba(255,255,255,0.06);}
+            QCheckBox::indicator:checked{background:rgba(99,102,241,0.7);
+                                         border:1px solid rgba(99,102,241,0.9);}
+        """)
+        self.shortcut_chk.toggled.connect(self._set_shortcut)
+        layout.addWidget(self.shortcut_chk)
+        layout.addWidget(self._sep())
+
         # ── Model selector ──
         layout.addWidget(self._lbl("MODEL"))
         self.model_combo = QComboBox()
@@ -621,6 +638,17 @@ class SettingsOverlay(QWidget):
             self.status.setStyleSheet("color:rgba(255,100,100,0.9);font-size:12px;"
                                       "background:transparent;border:none;")
             self.status.setText(f"✗ Startup error: {str(e)[:60]}")
+
+    def _set_shortcut(self, enabled):
+        try:
+            config.create_shortcut() if enabled else config.remove_shortcut()
+        except Exception as e:
+            self.shortcut_chk.blockSignals(True)
+            self.shortcut_chk.setChecked(not enabled)
+            self.shortcut_chk.blockSignals(False)
+            self.status.setStyleSheet("color:rgba(255,100,100,0.9);font-size:12px;"
+                                      "background:transparent;border:none;")
+            self.status.setText(f"✗ Shortcut error: {str(e)[:60]}")
 
     def paintEvent(self, _):
         p = QPainter(self)

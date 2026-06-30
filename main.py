@@ -3,6 +3,9 @@ import threading
 import keyboard
 import win32clipboard
 import win32con
+import win32event
+import win32api
+import winerror
 import time
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QObject, pyqtSignal
@@ -97,6 +100,11 @@ def run_tray(bridge):
 
 
 def main():
+    # ── single instance guard ──
+    mutex = win32event.CreateMutex(None, False, f"Global\\{APP_NAME}_mutex")
+    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        sys.exit(0)  # another instance is running, silently exit
+
     db.init_db()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
